@@ -135,5 +135,6 @@ Designed for academic and educational purposes only.
 ---
 
 **Author:** Xiang Guanhua
-**University:** School of Automation and Intelligence
-**Date:** 2025
+**University:** BJTU School of Automation and Intelligence
+**Date:** 2025.12.31
+
