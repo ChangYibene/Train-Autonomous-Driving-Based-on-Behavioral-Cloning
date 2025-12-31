@@ -1,183 +1,115 @@
 import sys
+import os
 import traceback
-import numpy as np  # <--- 已补上此引用
-import torch
-import torch.optim as optim
-import torch.nn as nn
+import numpy as np
 from PyQt5.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout, QWidget,
                              QPushButton, QLabel, QMessageBox, QTableWidget,
-                             QTableWidgetItem, QGroupBox, QApplication, QHeaderView)
-from PyQt5.QtCore import QTimer, Qt, QThread, pyqtSignal
+                             QTableWidgetItem, QGroupBox, QApplication, QHeaderView,
+                             QComboBox, QFileDialog)
+from PyQt5.QtCore import QTimer, Qt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
-# === 导入自定义模块 ===
 try:
-    from train_dynamics import TrainDynamics
-    from track_profile import TrackProfile
-    from mpc_controller import SimpleMPC
-    from policy_network import PolicyNetwork
+    from simulation_core import SimulationCore
+    from training_service import TrainingWorker
 except ImportError as e:
-    print(f"【严重错误】缺少必要模块: {e}")
+    print(f"【严重错误】缺少核心模块: {e}")
     sys.exit(1)
 
 
-# ==========================================
-# 1. 后台训练线程类
-# ==========================================
-class TrainingWorker(QThread):
-    progress_signal = pyqtSignal(int, int, float)
-    finished_signal = pyqtSignal(float)
-    error_signal = pyqtSignal(str)
-
-    def __init__(self, net, dataset, epochs=500, lr=0.002):
-        super().__init__()
-        self.net = net
-        self.dataset = dataset
-        self.epochs = epochs
-        self.lr = lr
-        self._is_running = True
-
-    def run(self):
-        try:
-            if not self.dataset:
-                raise ValueError("数据集为空！请先运行 MPC 采集数据。")
-
-            # 数据预处理
-            try:
-                # dataset结构: [(([scalar], [seq]), action), ...]
-                scalar_data = [d[0][0] for d in self.dataset]
-                seq_data = [d[0][1] for d in self.dataset]
-                actions = [[d[1]] for d in self.dataset]
-
-                X_scalar = torch.tensor(scalar_data, dtype=torch.float32)
-                # [N, 10] -> [N, 1, 10] 用于 Conv1d
-                X_seq = torch.tensor(seq_data, dtype=torch.float32).unsqueeze(1)
-                Y = torch.tensor(actions, dtype=torch.float32)
-            except Exception as e:
-                raise ValueError(f"数据格式错误，这通常是因为 MPC 代码版本过旧导致的。\n详情: {e}")
-
-            optimizer = optim.Adam(self.net.parameters(), lr=self.lr)
-            criterion = nn.MSELoss()
-            self.net.train()
-            final_loss = 0.0
-
-            for e in range(self.epochs):
-                if not self._is_running: break
-                optimizer.zero_grad()
-
-                # 双输入前向传播
-                try:
-                    output = self.net(X_scalar, X_seq)
-                except TypeError:
-                    raise RuntimeError("PolicyNetwork 版本过旧！请更新 policy_network.py 以支持双输入。")
-
-                loss = criterion(output, Y)
-                loss.backward()
-                optimizer.step()
-                final_loss = loss.item()
-
-                if e % 10 == 0 or e == self.epochs - 1:
-                    self.progress_signal.emit(e + 1, self.epochs, final_loss)
-
-            self.finished_signal.emit(final_loss)
-
-        except Exception as e:
-            self.error_signal.emit(traceback.format_exc())
-
-    def stop(self):
-        self._is_running = False
-
-
-# ==========================================
-# 2. 主界面类
-# ==========================================
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("CR400AF 自动驾驶仿真 (最终修复版)")
-        self.resize(1280, 800)
+        self.setWindowTitle("智能列车驾驶仿真平台 (含PID对比实验)")
+        self.resize(1380, 850)
 
-        # 1. 模块初始化
-        self.total_distance = 15000
-        self.track = TrackProfile(self.total_distance)
-        self.dynamics = TrainDynamics()
-        self.mpc = SimpleMPC(self.dynamics, self.track)
-        self.net = PolicyNetwork()
+        self.core = SimulationCore()
 
-        # 检查 MPC 版本兼容性
-        if not hasattr(self.mpc, 'last_u'):
-            QMessageBox.critical(self, "版本不匹配", "mpc_controller.py 版本过旧！\n请添加 self.last_u 属性。")
-
-        self.dataset = []
         self.sim_mode = "IDLE"
-        self.sim_data = {"pos": [], "vel": [], "acc": [], "target": []}
+
+        # 主要数据缓存 (MPC 或 AI)
+        self.plot_data = {"pos": [], "vel": [], "target": []}
+
+        # [新增] PID 数据缓存 (用于对比绘图)
+        self.pid_data = {"pos": [], "vel": []}
+
         self.train_thread = None
+        self.last_open_path = "D:\\"
 
         self.setup_ui()
-        self.generate_default_curve()
+        self.init_default_track()
 
         self.timer = QTimer()
-        self.timer.timeout.connect(self.game_loop)
-
-    def update_plot(self):
-        """实时更新仿真曲线"""
-        self.ax.clear()
-        self.ax.plot(self.track.x, self.track.target_curve * 3.6, 'r-', alpha=0.4, label='Target')
-        if self.sim_data["pos"]:
-            self.ax.plot(self.sim_data["pos"], self.sim_data["vel"], 'b-', linewidth=2, label='Actual Speed')
-
-        self.ax.set_ylim(0, 400)
-        self.ax.set_ylabel("Speed (km/h)")
-        self.ax.set_xlabel("Distance (m)")
-        self.ax.legend(loc='upper right')
-        self.ax.grid(True)
-        self.canvas.draw()
+        self.timer.timeout.connect(self.update_loop)
 
     def setup_ui(self):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         layout = QHBoxLayout(main_widget)
 
-        # 左侧面板
+        # --- 左侧: 控制面板 ---
         left_panel = QWidget()
+        left_panel.setFixedWidth(400)
         l_layout = QVBoxLayout(left_panel)
-        left_panel.setFixedWidth(380)
 
-        # 线路表格
-        grp_line = QGroupBox("1. 线路配置")
-        v_line = QVBoxLayout(grp_line)
+        # A. 模式选择
+        grp_mode = QGroupBox("0. 模式选择")
+        v_mode = QVBoxLayout(grp_mode)
+        self.combo_mode = QComboBox()
+        self.combo_mode.addItems(["模式一：CR400AF + MPC仿真", "模式二：真实数据驱动 (亦庄线/地铁)"])
+        self.combo_mode.currentIndexChanged.connect(self.on_mode_changed)
+        v_mode.addWidget(self.combo_mode)
+        l_layout.addWidget(grp_mode)
+
+        # B. 线路配置
+        self.grp_line = QGroupBox("1. 线路配置 (MPC模式)")
+        v_line = QVBoxLayout(self.grp_line)
         self.table = QTableWidget(4, 3)
         self.table.setHorizontalHeaderLabels(["起点", "终点", "限速"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         btn_gen = QPushButton("应用线路设置")
-        btn_gen.clicked.connect(self.generate_curve_from_table)
+        btn_gen.clicked.connect(self.apply_track_settings)
         v_line.addWidget(self.table)
         v_line.addWidget(btn_gen)
-        l_layout.addWidget(grp_line)
+        l_layout.addWidget(self.grp_line)
 
-        # 控制按钮
-        grp_ctrl = QGroupBox("2. 操作面板")
+        # C. 操作流程
+        grp_ctrl = QGroupBox("2. 操作流程")
         v_ctrl = QVBoxLayout(grp_ctrl)
-        self.btn_mpc = QPushButton("启动 MPC (采集)")
-        self.btn_mpc.clicked.connect(lambda: self.start_sim("MPC"))
-        self.btn_train = QPushButton("训练模型 (多线程)")
-        self.btn_train.clicked.connect(self.start_training_thread)
-        self.btn_ai = QPushButton("启动 AI (验证)")
+
+        # 动态按钮：在模式二下变成"选择文件"
+        self.btn_step1 = QPushButton("第一步：启动 MPC (采集)")
+        self.btn_step1.clicked.connect(self.on_step1_clicked)
+        self.btn_step1.setStyleSheet("background-color: #ADD8E6; padding: 10px; font-weight: bold;")
+
+        self.btn_train = QPushButton("第二步：训练 AI 模型")
+        self.btn_train.clicked.connect(self.start_training)
+
+        self.btn_ai = QPushButton("第三步：启动 AI (验证)")
         self.btn_ai.clicked.connect(lambda: self.start_sim("AI"))
-        v_ctrl.addWidget(self.btn_mpc)
+        self.btn_ai.setStyleSheet("background-color: #FFB6C1; padding: 10px; font-weight: bold;")
+
+        # [新增] PID 对比按钮
+        self.btn_pid = QPushButton("第四步：启动 PID (对比)")
+        self.btn_pid.clicked.connect(lambda: self.start_sim("PID"))
+        self.btn_pid.setStyleSheet("background-color: #FFFACD; padding: 10px; font-weight: bold;")
+
+        v_ctrl.addWidget(self.btn_step1)
         v_ctrl.addWidget(self.btn_train)
         v_ctrl.addWidget(self.btn_ai)
+        v_ctrl.addWidget(self.btn_pid)  # 加入布局
         l_layout.addWidget(grp_ctrl)
 
-        # 仪表盘
+        # D. 仪表盘
         grp_dash = QGroupBox("3. 状态监视")
         v_dash = QVBoxLayout(grp_dash)
-        self.lbl_status = QLabel("就绪")
+        self.lbl_status = QLabel("系统就绪")
         self.lbl_val = QLabel("位置: 0.0m | 速度: 0.0km/h")
         self.lbl_acc = QLabel("加速度: 0.00 m/s²")
         self.lbl_warn = QLabel("")
         self.lbl_warn.setStyleSheet("color: red; font-weight: bold;")
+
         v_dash.addWidget(self.lbl_status)
         v_dash.addWidget(self.lbl_val)
         v_dash.addWidget(self.lbl_acc)
@@ -186,7 +118,7 @@ class MainWindow(QMainWindow):
 
         l_layout.addStretch()
 
-        # 右侧绘图
+        # --- 右侧: 绘图区 ---
         right_panel = QWidget()
         r_layout = QVBoxLayout(right_panel)
         self.figure = Figure()
@@ -197,158 +129,238 @@ class MainWindow(QMainWindow):
         layout.addWidget(left_panel)
         layout.addWidget(right_panel)
 
-    def get_state_context(self, current_pos, current_vel, last_u):
-        """构建双模态状态"""
-        target_v = self.track.get_target_v(current_pos)
-        v_err = target_v - current_vel
-        scalar = [current_vel / 100.0, v_err / 20.0, last_u]
-
-        seq = []
-        look_dist = 0
-        v_sim = max(current_vel, 1.0)
-        for _ in range(10):
-            look_dist += v_sim * 1.0
-            p_next = current_pos + look_dist
-            t_v_next = self.track.get_target_v(p_next)
-            seq.append((t_v_next - current_vel) / 20.0)
-        return scalar, seq
-
-    def generate_default_curve(self):
+    def init_default_track(self):
         defaults = [(0, 5000, 200), (5000, 10000, 350), (10000, 12000, 160), (12000, 15000, 80)]
         for r, (s, e, v) in enumerate(defaults):
             self.table.setItem(r, 0, QTableWidgetItem(str(s)))
             self.table.setItem(r, 1, QTableWidgetItem(str(e)))
             self.table.setItem(r, 2, QTableWidgetItem(str(v)))
-        self.generate_curve_from_table()
+        self.apply_track_settings()
 
-    def generate_curve_from_table(self):
+    def on_mode_changed(self, index):
+        if index == 0:
+            # 模式一
+            self.btn_step1.setText("第一步：启动 MPC (采集)")
+            self.grp_line.setTitle("1. 线路配置 (MPC模式)")
+            self.grp_line.setEnabled(True)
+        else:
+            # 模式二
+            self.btn_step1.setText("第一步：选择数据文件 (xlsx/csv)")
+            self.grp_line.setTitle("1. 线路配置 (自动读取文件)")
+            self.grp_line.setEnabled(False)
+
+    def on_step1_clicked(self):
+        if self.combo_mode.currentIndex() == 0:
+            self.start_sim("MPC")
+        else:
+            self.load_real_data()
+
+    def load_real_data(self):
+        """弹出文件选择框读取数据"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择训练数据文件",
+            self.last_open_path,
+            "Data Files (*.xlsx *.xls *.csv);;All Files (*)"
+        )
+
+        if not file_path:
+            return
+
+        self.last_open_path = os.path.dirname(file_path)
+        self.lbl_status.setText(f"正在读取: {os.path.basename(file_path)}...")
+        QApplication.processEvents()
+
+        # 调用 Core -> DataLoader
+        success, msg = self.core.load_external_data(file_path)
+
+        if success:
+            QMessageBox.information(self, "读取成功", msg)
+            self.lbl_status.setText(f"已加载: {os.path.basename(file_path)}")
+            # 清空之前的PID数据，因为换了新文件
+            self.pid_data = {"pos": [], "vel": []}
+            self.plot_data = {"pos": [], "vel": [], "target": []}
+            self.update_static_plot()
+        else:
+            QMessageBox.critical(self, "读取失败", msg)
+            self.lbl_status.setText("读取失败")
+
+    def update_static_plot(self):
+        """只更新背景图，不画动态线"""
+        self.ax.clear()
+        ext = self.core.external_data
+        if ext["pos"]:
+            self.ax.plot(ext["pos"], ext["vel"], 'g-', label='Human Driver (Real)')
+            self.ax.plot(ext["pos"], ext["target"], 'r--', alpha=0.6, label='Target Profile')
+        self.ax.set_title(f"Data Loaded")
+        self.ax.set_xlabel("Distance (m)")
+        self.ax.set_ylabel("Speed (km/h)")
+        self.ax.legend()
+        self.ax.grid(True)
+        self.canvas.draw()
+
+    def apply_track_settings(self):
+        if self.combo_mode.currentIndex() == 1: return
         try:
-            self.track.reset_limits()
+            self.core.track.reset_limits()
             for r in range(self.table.rowCount()):
                 s = self.table.item(r, 0)
                 e = self.table.item(r, 1)
                 v = self.table.item(r, 2)
                 if s and e and v:
-                    self.track.apply_limit(float(s.text()), float(e.text()), float(v.text()))
-            self.track.calculate_braking_curve()
-            self.update_plot()
+                    self.core.track.apply_limit(float(s.text()), float(e.text()), float(v.text()))
+            self.core.track.calculate_braking_curve()
+            self.refresh_static_plot()
         except ValueError:
-            QMessageBox.warning(self, "错误", "输入数据无效")
+            QMessageBox.warning(self, "错误", "表格输入数据无效")
+
+    def refresh_static_plot(self):
+        self.ax.clear()
+        self.ax.plot(self.core.track.x, self.core.track.static_limit * 3.6, 'k--', alpha=0.3, label='ATP Limit')
+        self.ax.plot(self.core.track.x, self.core.track.target_curve * 3.6, 'r-', label='Target')
+        self.ax.legend()
+        self.ax.grid(True)
+        self.canvas.draw()
 
     def start_sim(self, mode):
-        if mode == "AI" and not self.dataset:
-            QMessageBox.warning(self, "警告", "无训练数据，请先运行 MPC 并训练！")
+        # AI 模式检查数据
+        if mode == "AI" and not self.core.dataset:
+            QMessageBox.warning(self, "警告", "无训练数据！请先执行第一步和第二步。")
             return
 
         self.sim_mode = mode
-        self.dynamics = TrainDynamics()
-        self.mpc.reset()  # 只有 MPC 模式下 reset 会清空 last_u
-        self.curr_pos = 0.0
-        self.curr_vel = 0.0
-        self.sim_data = {"pos": [], "vel": [], "acc": [], "target": []}
+        self.core.reset()
 
-        if mode == "MPC":
-            self.dataset = []
-            self.lbl_status.setText("状态: MPC 采集数据中...")
+        # === 逻辑：只有 PID 模式下不清空 AI 绘图数据，实现叠加 ===
+        if mode == "PID":
+            self.pid_data = {"pos": [], "vel": []}  # 只清空 PID，准备重跑
+            self.lbl_status.setText("状态: PID 对比实验运行中...")
         else:
-            self.lbl_status.setText("状态: AI 验证中...")
+            # 如果是 AI 或 MPC，则清空所有旧数据，开始新的一轮
+            self.plot_data = {"pos": [], "vel": [], "target": []}
+            self.pid_data = {"pos": [], "vel": []}  # 清空 PID，防止混淆
+
+            if mode == "MPC":
+                self.core.dataset = []
+                self.lbl_status.setText("状态: MPC 运行中...")
+            else:
+                self.lbl_status.setText("状态: AI 接管验证中...")
 
         self.timer.start(100)
 
-    def game_loop(self):
+    def update_loop(self):
         try:
-            # 1. 结束判断
-            if self.curr_pos >= self.total_distance:
+            data = self.core.step(self.sim_mode)
+            status = data.get("status", "RUNNING")
+
+            # === [UI更新] 处理终止状态 ===
+            if status != "RUNNING":
                 self.timer.stop()
-                self.lbl_status.setText("运行结束")
+
+                msg = ""
+                icon = QMessageBox.Information
+
+                if status == "SUCCESS":
+                    msg = "🎉 完美停车！\nAI/PID 成功停靠在目标点附近，且速度归零。"
+                    icon = QMessageBox.Information
+                elif status == "OVERRUN":
+                    msg = "❌ 冲出终点！\n未能及时刹车，列车已越过停止线 >5m。"
+                    icon = QMessageBox.Critical
+                elif status == "STALL":
+                    msg = "⚠️ 中途停车！\n过于保守或动力不足，未到达终点即停止。"
+                    icon = QMessageBox.Warning
+                elif status == "TIMEOUT":
+                    msg = "⏱️ 运行超时！\n仿真时间过长，系统强制停止。"
+                    icon = QMessageBox.Warning
+                elif status == "DATA_END":
+                    msg = "📊 数据回放结束。\n已到达CSV文件记录的终点。"
+                    icon = QMessageBox.Information
+
                 if self.sim_mode == "MPC":
-                    QMessageBox.information(self, "完成", f"采集数据: {len(self.dataset)} 条")
+                    msg += f"\n\n已采集样本: {data['dataset_count']} 条"
+
+                self.lbl_status.setText(f"运行结束: {status}")
+
+                # 弹窗提示
+                box = QMessageBox(self)
+                box.setWindowTitle(f"运行结果 ({self.sim_mode})")
+                box.setText(msg)
+                box.setIcon(icon)
+                box.exec_()
                 return
 
-            # 2. 获取状态
-            scalar, seq = self.get_state_context(self.curr_pos, self.curr_vel, self.mpc.last_u)
-            # 【修复点】这里需要 numpy 来处理索引，现在已经 import 了
-            atp_limit = self.track.static_limit[int(np.clip(self.curr_pos, 0, self.total_distance))]
+            # === 正常更新界面 ===
+            self.lbl_val.setText(f"位置: {data['pos']:.1f}m | 速度: {data['vel']:.1f} km/h")
+            self.lbl_acc.setText(f"加速度: {data['acc']:.2f} m/s²")
 
-            # 3. 控制决策
-            u = 0.0
-            if self.sim_mode == "MPC":
-                u = self.mpc.get_action(self.curr_pos, self.curr_vel)
-                self.dataset.append(((scalar, seq), u))
+            if data['is_emergency']:
+                self.lbl_warn.setText("⚠️ ATP 紧急制动触发！")
+            else:
+                self.lbl_warn.setText("")
 
-            elif self.sim_mode == "AI":
-                t_scalar = torch.tensor([scalar], dtype=torch.float32)
-                t_seq = torch.tensor([[seq]], dtype=torch.float32)  # [1, 1, 10]
-                with torch.no_grad():
-                    u = self.net(t_scalar, t_seq).item()
+            # === 数据记录分流 ===
+            if self.sim_mode == "PID":
+                self.pid_data["pos"].append(data['pos'])
+                self.pid_data["vel"].append(data['vel'])
+            else:
+                self.plot_data["pos"].append(data['pos'])
+                self.plot_data["vel"].append(data['vel'])
+                self.plot_data["target"].append(data['target_v'])
 
-            # 4. ATP 安全防护 (AI 模式下的兜底)
-            is_emergency = False
-            if self.curr_vel > (atp_limit + 1.0 / 3.6):  # 超速 1km/h
-                u = -1.0
-                is_emergency = True
-            elif self.curr_vel > atp_limit:
-                u = min(u, -0.5)
+            # === 绘图逻辑 (支持图层叠加) ===
+            # PID模式下每5帧刷新，非PID模式也每5帧刷新
+            if len(self.plot_data["pos"]) % 5 == 0 or (self.sim_mode == "PID" and len(self.pid_data["pos"]) % 5 == 0):
+                self.ax.clear()
 
-            # 5. 物理更新
-            self.curr_pos, self.curr_vel, _ = self.dynamics.step(self.curr_pos, self.curr_vel, u)
+                # 1. 底层：背景 (真实数据 or 目标曲线)
+                if self.combo_mode.currentIndex() == 1:
+                    ext = self.core.external_data
+                    if ext["pos"]:
+                        self.ax.plot(ext["pos"], ext["vel"], 'g-', alpha=0.3, label='Human (Real)')
+                        self.ax.set_ylim(0, 120)
+                else:
+                    self.ax.plot(self.core.track.x, self.core.track.target_curve * 3.6, 'r-', alpha=0.4, label='Target')
+                    self.ax.set_ylim(0, 420)
 
-            # 6. 计算显示用加速度
-            force = self.dynamics.current_force
-            res = 1.0 + 0.01 * self.curr_vel + 0.0008 * self.curr_vel ** 2
-            acc = 0.0
-            if not (self.curr_vel < 0.1 and 0 < force <= 3.0):
-                acc = (force - res) / self.dynamics.mass
+                # 2. 中层：AI / MPC (蓝色实线)
+                # 只要有数据就画，这样在跑 PID 时，AI 的线依然保留在图上
+                if self.plot_data["pos"]:
+                    self.ax.plot(self.plot_data["pos"], self.plot_data["vel"], 'b-', linewidth=2, label='AI/MPC')
 
-            # 7. 更新UI数据
-            self.sim_data["pos"].append(self.curr_pos)
-            self.sim_data["vel"].append(self.curr_vel * 3.6)
-            self.sim_data["acc"].append(acc)
+                # 3. 顶层：PID (橙色虚线)
+                if self.pid_data["pos"]:
+                    self.ax.plot(self.pid_data["pos"], self.pid_data["vel"], 'orange', linestyle='--', linewidth=2,
+                                 label='PID Baseline')
 
-            if len(self.sim_data["pos"]) % 2 == 0:
-                self.lbl_val.setText(f"位置: {self.curr_pos:.1f}m | 速度: {self.curr_vel * 3.6:.1f} km/h")
-                self.lbl_acc.setText(f"加速度: {acc:.2f} m/s²")
-                self.lbl_warn.setText("⚠️ ATP 触发!" if is_emergency else "")
-
-            if len(self.sim_data["pos"]) % 5 == 0:
-                self.update_plot()
+                self.ax.legend(loc='upper right')
+                self.ax.grid(True)
+                self.canvas.draw()
 
         except Exception as e:
             self.timer.stop()
             print(traceback.format_exc())
-            QMessageBox.critical(self, "运行错误", f"发生未捕获异常:\n{e}")
+            QMessageBox.critical(self, "运行错误", f"仿真异常:\n{e}")
 
-    # --- 训练逻辑 ---
-    def start_training_thread(self):
-        if not self.dataset:
-            QMessageBox.warning(self, "提示", "请先运行 MPC 采集数据")
+    # === 训练 ===
+    def start_training(self):
+        if not self.core.dataset:
+            QMessageBox.warning(self, "无数据", "请先采集或读取数据！")
             return
 
-        self.btn_mpc.setEnabled(False)
         self.btn_train.setEnabled(False)
-        self.btn_ai.setEnabled(False)
-        self.lbl_status.setText("训练初始化...")
+        self.lbl_status.setText("初始化训练...")
 
-        self.train_thread = TrainingWorker(self.net, self.dataset)
-        self.train_thread.progress_signal.connect(
-            lambda c, t, l: self.lbl_status.setText(f"训练中: {c}/{t} Loss:{l:.4f}"))
-        self.train_thread.finished_signal.connect(self.on_train_finished)
-        self.train_thread.error_signal.connect(self.on_train_error)
-        self.train_thread.start()
+        self.trainer = TrainingWorker(self.core.net, self.core.dataset)
+        self.trainer.progress_signal.connect(lambda c, t, l: self.lbl_status.setText(f"训练中: {c}/{t} Loss:{l:.4f}"))
+        self.trainer.finished_signal.connect(self.on_train_done)
+        self.trainer.error_signal.connect(lambda msg: QMessageBox.critical(self, "训练错误", msg))
 
-    def on_train_finished(self, loss):
+        self.trainer.start()
+
+    def on_train_done(self, loss):
         self.lbl_status.setText(f"训练完成 Loss: {loss:.5f}")
-        QMessageBox.information(self, "成功", "模型已更新")
-        self.btn_mpc.setEnabled(True)
+        QMessageBox.information(self, "成功", f"模型训练完成\n最终 Loss: {loss:.5f}")
         self.btn_train.setEnabled(True)
-        self.btn_ai.setEnabled(True)
-
-    def on_train_error(self, msg):
-        self.lbl_status.setText("训练失败")
-        self.btn_mpc.setEnabled(True)
-        self.btn_train.setEnabled(True)
-        self.btn_ai.setEnabled(True)
-        QMessageBox.critical(self, "训练错误", msg)
 
 
 if __name__ == "__main__":
