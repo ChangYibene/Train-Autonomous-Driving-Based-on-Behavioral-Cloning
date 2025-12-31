@@ -1,55 +1,58 @@
-import numpy as np
 import torch
+import numpy as np
 from train_dynamics import TrainDynamics
 from track_profile import TrackProfile
 from mpc_controller import SimpleMPC
 from policy_network import PolicyNetwork
+from data_loader import DataLoader
 
 
 class SimulationCore:
-    """
-    仿真核心管理器
-    职责：
-    1. 管理所有子模块 (物理, 线路, 控制器)
-    2. 执行单步仿真 (Step)
-    3. 执行 ATP 安全防护
-    4. 格式化 AI 输入数据
-    """
-
     def __init__(self, total_distance=15000):
-        self.total_distance = total_distance
-
-        # 初始化子模块
-        self.track = TrackProfile(self.total_distance)
-        self.dynamics = TrainDynamics()
+        self.default_distance = total_distance
+        self.track = TrackProfile(self.default_distance)
+        self.dynamics = TrainDynamics("CR400AF")
         self.mpc = SimpleMPC(self.dynamics, self.track)
         self.net = PolicyNetwork()
 
-        # 运行时状态
         self.curr_pos = 0.0
         self.curr_vel = 0.0
-        self.dataset = []  # 存储 (state, action)
+        self.dataset = []
+        self.external_data = {"pos": [], "vel": [], "u": [], "target": []}
+
+        self.is_metro_mode = False
 
     def reset(self):
-        self.dynamics = TrainDynamics()  # 重置物理状态
+        v_type = "METRO" if self.is_metro_mode else "CR400AF"
+        self.dynamics = TrainDynamics(v_type)
         self.mpc.reset()
         self.curr_pos = 0.0
         self.curr_vel = 0.0
 
-
     def get_atp_limit(self, pos):
-        """获取当前位置的 ATP 硬限速"""
         idx = int(np.clip(pos, 0, self.track.total_dist))
+        if idx >= len(self.track.static_limit): idx = -1
         return self.track.static_limit[idx]
 
     def _get_ai_state(self):
-        """构建符合论文要求的双模态状态 (Scalar + Sequence)"""
-        # 1. 标量状态
-        target_v = self.track.get_target_v(self.curr_pos)
-        v_err = target_v - self.curr_vel
-        scalar = [self.curr_vel / 100.0, v_err / 20.0, self.mpc.last_u]
+        if self.is_metro_mode:
+            NORM_V = 25.0
+            NORM_ERR = 10.0
+        else:
+            NORM_V = 100.0
+            NORM_ERR = 20.0
 
-        # 2. 序列状态 (前瞻10步)
+        target_v = self.track.get_target_v(self.curr_pos)
+
+        # [策略优化] 欺骗 AI：告诉它目标速度比实际低一点点 (0.5 km/h)
+        # 这样 AI 会倾向于跑得慢一点，留出安全余量
+        safe_target_v = target_v
+        if self.is_metro_mode:
+            safe_target_v = max(0, target_v - 0.5 / 3.6)
+
+        v_err = safe_target_v - self.curr_vel
+        scalar = [self.curr_vel / NORM_V, v_err / NORM_ERR, self.mpc.last_u]
+
         seq = []
         look_dist = 0
         v_sim = max(self.curr_vel, 1.0)
@@ -57,59 +60,77 @@ class SimulationCore:
             look_dist += v_sim * 1.0
             p_next = self.curr_pos + look_dist
             t_v_next = self.track.get_target_v(p_next)
-            seq.append((t_v_next - self.curr_vel) / 20.0)
+            seq.append((t_v_next - self.curr_vel) / NORM_ERR)
 
         return scalar, seq
 
+    def load_external_data(self, folder_path):
+        dataset, ext_data, track, msg = DataLoader.load_yizhuang_data(folder_path)
+        if dataset is None: return False, msg
+        self.dataset = dataset
+        self.external_data = ext_data
+        self.track = track
+        self.is_metro_mode = True
+        return True, msg
+
     def step(self, mode):
-        """
-        执行一步仿真
-        返回: 包含所有显示所需数据的字典
-        """
-        if self.curr_pos >= self.total_distance:
+        if mode == "MPC" and self.is_metro_mode:
+            self.is_metro_mode = False
+            self.track = TrackProfile(self.default_distance)
+            self.reset()
+
+        if self.curr_pos >= self.track.total_dist:
             return {"finished": True}
 
-        # 1. 获取状态
         scalar, seq = self._get_ai_state()
         target_v = self.track.get_target_v(self.curr_pos)
 
-        # 2. 计算控制量 u
         u = 0.0
         if mode == "MPC":
             u = self.mpc.get_action(self.curr_pos, self.curr_vel)
-            # 收集数据
             self.dataset.append(((scalar, seq), u))
 
         elif mode == "AI":
             t_scalar = torch.tensor([scalar], dtype=torch.float32)
-            t_seq = torch.tensor([[seq]], dtype=torch.float32).unsqueeze(1)  # [1, 1, 10]
+            t_seq = torch.tensor([seq], dtype=torch.float32).unsqueeze(1)
             with torch.no_grad():
                 u = self.net(t_scalar, t_seq).item()
 
-        # 3. ATP 安全防护 (独立于 AI/MPC)
+        # === ATP 安全防护 (针对模式二的强力修正) ===
         atp_limit = self.get_atp_limit(self.curr_pos)
         is_emergency = False
 
-        if self.curr_vel > (atp_limit + 1.0 / 3.6):  # 超速 1km/h
-            u = -1.0  # 紧急制动
-            is_emergency = True
-        elif self.curr_vel > atp_limit:
-            u = min(u, -0.5)  # 常用制动
+        if self.is_metro_mode:
+            # 地铁模式：零容忍策略
+            # CSV里的"目标速度"其实就是ATO曲线，不能超
+            if self.curr_vel > target_v:
+                # 一旦超过目标速度，无视 AI，强制介入
+                # 如果超得不多，用轻刹车；超多了用急刹车
+                over_speed = self.curr_vel - target_v
+                if over_speed > 1.0 / 3.6:
+                    u = -1.0  # 严重超速 (>1km/h) -> 紧急制动
+                    is_emergency = True
+                else:
+                    u = min(u, -0.5)  # 轻微超速 -> 常用制动
+        else:
+            # 高铁模式：原来的宽松策略
+            if self.curr_vel > (atp_limit + 3.0 / 3.6):
+                u = -1.0
+                is_emergency = True
+            elif self.curr_vel > atp_limit:
+                u = min(u, -0.5)
 
-        # 4. 物理更新
         self.curr_pos, self.curr_vel, _ = self.dynamics.step(self.curr_pos, self.curr_vel, u)
 
-        # 5. 计算高精度加速度 (用于显示)
         force = self.dynamics.current_force
         res = 1.0 + 0.01 * self.curr_vel + 0.0008 * self.curr_vel ** 2
         acc = (force - res) / self.dynamics.mass
         if self.curr_vel < 0.1 and 0 < force <= 3.0: acc = 0.0
 
-        # 返回数据包给 GUI
         return {
             "finished": False,
             "pos": self.curr_pos,
-            "vel": self.curr_vel * 3.6,  # km/h
+            "vel": self.curr_vel * 3.6,
             "target_v": target_v * 3.6,
             "acc": acc,
             "atp_limit": atp_limit * 3.6,
