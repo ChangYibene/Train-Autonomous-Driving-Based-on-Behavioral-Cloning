@@ -1,115 +1,173 @@
-import numpy as np
 import torch
+import numpy as np
 from train_dynamics import TrainDynamics
 from track_profile import TrackProfile
 from mpc_controller import SimpleMPC
 from policy_network import PolicyNetwork
+from data_loader import DataLoader
+
+try:
+    from pid_controller import PIDController
+except:
+    pass
 
 
 class SimulationCore:
-    """
-    仿真核心管理器
-    职责：
-    1. 管理所有子模块 (物理, 线路, 控制器)
-    2. 执行单步仿真 (Step)
-    3. 执行 ATP 安全防护
-    4. 格式化 AI 输入数据
-    """
-
     def __init__(self, total_distance=15000):
-        self.total_distance = total_distance
-
-        # 初始化子模块
-        self.track = TrackProfile(self.total_distance)
-        self.dynamics = TrainDynamics()
+        self.default_distance = total_distance
+        self.track = TrackProfile(self.default_distance)
+        self.dynamics = TrainDynamics("CR400AF")
         self.mpc = SimpleMPC(self.dynamics, self.track)
-        self.net = PolicyNetwork()
+        self.net = PolicyNetwork()  # V2.0 (LSTM+DeepCNN)
 
-        # 运行时状态
+        try:
+            self.pid = PIDController()
+        except:
+            self.pid = None
+
         self.curr_pos = 0.0
         self.curr_vel = 0.0
-        self.dataset = []  # 存储 (state, action)
+        self.step_count = 0
+        self.max_steps = 5000
+
+        self.dataset = []
+        self.external_data = {"pos": [], "vel": [], "u": [], "target": []}
+        self.is_metro_mode = False
 
     def reset(self):
-        self.dynamics = TrainDynamics()  # 重置物理状态
+        v_type = "METRO" if self.is_metro_mode else "CR400AF"
+        self.dynamics = TrainDynamics(v_type)
         self.mpc.reset()
+        if self.pid: self.pid.reset()
         self.curr_pos = 0.0
         self.curr_vel = 0.0
-
+        self.step_count = 0
 
     def get_atp_limit(self, pos):
-        """获取当前位置的 ATP 硬限速"""
         idx = int(np.clip(pos, 0, self.track.total_dist))
+        if idx >= len(self.track.static_limit): idx = -1
         return self.track.static_limit[idx]
 
     def _get_ai_state(self):
-        """构建符合论文要求的双模态状态 (Scalar + Sequence)"""
-        # 1. 标量状态
-        target_v = self.track.get_target_v(self.curr_pos)
-        v_err = target_v - self.curr_vel
-        scalar = [self.curr_vel / 100.0, v_err / 20.0, self.mpc.last_u]
+        # [必须同步] 视野参数
+        LOOK_AHEAD_STEPS = 50
 
-        # 2. 序列状态 (前瞻10步)
+        if self.is_metro_mode:
+            NORM_V = 25.0
+            NORM_ERR = 10.0
+        else:
+            NORM_V = 100.0
+            NORM_ERR = 20.0
+
+        target_v = self.track.get_target_v(self.curr_pos)
+
+        # 欺骗策略
+        safe_target_v = target_v
+        if self.is_metro_mode:
+            safe_target_v = max(0, target_v - 0.5 / 3.6)
+
+        v_err = safe_target_v - self.curr_vel
+        scalar = [self.curr_vel / NORM_V, v_err / NORM_ERR, self.mpc.last_u]
+
+        # 序列构建 (50步)
         seq = []
         look_dist = 0
         v_sim = max(self.curr_vel, 1.0)
-        for _ in range(10):
-            look_dist += v_sim * 1.0
+
+        for _ in range(LOOK_AHEAD_STEPS):
+            look_dist += v_sim * 0.2
             p_next = self.curr_pos + look_dist
             t_v_next = self.track.get_target_v(p_next)
-            seq.append((t_v_next - self.curr_vel) / 20.0)
+            seq.append((t_v_next - self.curr_vel) / NORM_ERR)
 
         return scalar, seq
 
-    def step(self, mode):
-        """
-        执行一步仿真
-        返回: 包含所有显示所需数据的字典
-        """
-        if self.curr_pos >= self.total_distance:
-            return {"finished": True}
+    def load_external_data(self, folder_path):
+        dataset, ext_data, track, msg = DataLoader.load_yizhuang_data(folder_path)
+        if dataset is None: return False, msg
+        self.dataset = dataset
+        self.external_data = ext_data
+        self.track = track
+        self.is_metro_mode = True
+        return True, msg
 
-        # 1. 获取状态
+    def step(self, mode):
+        # 模式保护
+        if mode == "MPC" and self.is_metro_mode:
+            self.is_metro_mode = False
+            self.track = TrackProfile(self.default_distance)
+            self.reset()
+
+        self.step_count += 1
+
+        # 终止条件
+        status = "RUNNING"
+        dist_err = self.track.total_dist - self.curr_pos
+        if dist_err < -5.0:
+            status = "OVERRUN"
+        elif abs(dist_err) < 2.0 and self.curr_vel < (0.2 / 3.6):
+            status = "SUCCESS"
+        elif dist_err > 10.0 and self.curr_vel < 0.01 and self.step_count > 50:
+            status = "STALL"
+        elif self.step_count > self.max_steps:
+            status = "TIMEOUT"
+        elif self.is_metro_mode and self.curr_pos >= self.track.total_dist:
+            status = "DATA_END"
+
+        if status != "RUNNING":
+            return {"status": status, "pos": self.curr_pos, "vel": self.curr_vel * 3.6, "acc": 0.0,
+                    "target_v": 0.0, "atp_limit": 0.0, "is_emergency": False, "dataset_count": len(self.dataset)}
+
+        # 状态获取
         scalar, seq = self._get_ai_state()
         target_v = self.track.get_target_v(self.curr_pos)
-
-        # 2. 计算控制量 u
         u = 0.0
+
         if mode == "MPC":
             u = self.mpc.get_action(self.curr_pos, self.curr_vel)
-            # 收集数据
             self.dataset.append(((scalar, seq), u))
 
         elif mode == "AI":
             t_scalar = torch.tensor([scalar], dtype=torch.float32)
-            t_seq = torch.tensor([[seq]], dtype=torch.float32).unsqueeze(1)  # [1, 1, 10]
+            t_seq = torch.tensor([seq], dtype=torch.float32).unsqueeze(1)
             with torch.no_grad():
                 u = self.net(t_scalar, t_seq).item()
 
-        # 3. ATP 安全防护 (独立于 AI/MPC)
+        elif mode == "PID":
+            if self.pid: u = self.pid.get_action(self.curr_vel, target_v)
+
+        # ATP 防护
         atp_limit = self.get_atp_limit(self.curr_pos)
         is_emergency = False
 
-        if self.curr_vel > (atp_limit + 1.0 / 3.6):  # 超速 1km/h
-            u = -1.0  # 紧急制动
-            is_emergency = True
-        elif self.curr_vel > atp_limit:
-            u = min(u, -0.5)  # 常用制动
+        if self.is_metro_mode:
+            if self.curr_vel > target_v:
+                over_speed = self.curr_vel - target_v
+                if over_speed > 1.0 / 3.6:
+                    u = -1.0
+                    is_emergency = True
+                else:
+                    u = min(u, -0.5)
+        else:
+            if self.curr_vel > (atp_limit + 3.0 / 3.6):
+                u = -1.0
+                is_emergency = True
+            elif self.curr_vel > atp_limit:
+                u = min(u, -0.5)
 
-        # 4. 物理更新
+        # 物理更新
         self.curr_pos, self.curr_vel, _ = self.dynamics.step(self.curr_pos, self.curr_vel, u)
+        self.mpc.last_u = u
 
-        # 5. 计算高精度加速度 (用于显示)
         force = self.dynamics.current_force
         res = 1.0 + 0.01 * self.curr_vel + 0.0008 * self.curr_vel ** 2
         acc = (force - res) / self.dynamics.mass
         if self.curr_vel < 0.1 and 0 < force <= 3.0: acc = 0.0
 
-        # 返回数据包给 GUI
         return {
-            "finished": False,
+            "status": "RUNNING",
             "pos": self.curr_pos,
-            "vel": self.curr_vel * 3.6,  # km/h
+            "vel": self.curr_vel * 3.6,
             "target_v": target_v * 3.6,
             "acc": acc,
             "atp_limit": atp_limit * 3.6,
